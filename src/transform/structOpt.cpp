@@ -356,6 +356,17 @@ StructOpt::IsGEPByBitcast(Type * actualTy, Type * bcDestTy) {
   return IsGEPByBitcast(firstElemTy, bcDestTy);
 }
 
+// whether a load/store of type accessTy covers exactly one scalar field of allocTy (compared by
+// size). Clang copies small structs as one integer, e.g. a {float, float} as one i64: that access
+// spans two fields, which the SoA layout stores in different vectors, so the alloca must stay AoS
+static bool
+AccessesOneField(Type & accessTy, Type & allocTy, const DataLayout & layout) {
+  Type * fieldTy = &allocTy;
+  while (fieldTy->isAggregateType())
+    fieldTy = isa<StructType>(fieldTy) ? fieldTy->getStructElementType(0) : fieldTy->getArrayElementType();
+  return layout.getTypeStoreSize(&accessTy) == layout.getTypeStoreSize(fieldTy);
+}
+
 /// whether any address computation on this alloc is uniform
 /// the alloca can still be varying because of stored varying values
 bool
@@ -391,7 +402,8 @@ StructOpt::allUniformGeps(llvm::AllocaInst & allocaInst) {
         if (userInst->getOperand(0) == inst) { // leaking the value!
           return false;
         }
-        if (!VectorizableType(*cast<StoreInst>(userInst)->getValueOperand()->getType())) {
+        if (!VectorizableType(*cast<StoreInst>(userInst)->getValueOperand()->getType()) ||
+            !AccessesOneField(*cast<StoreInst>(userInst)->getValueOperand()->getType(), *allocaInst.getAllocatedType(), layout)) {
           IF_DEBUG_SO { errs() << "skip: accessing non-leaf element : " << *userInst << "\n"; }
           return false;
         }
@@ -399,7 +411,8 @@ StructOpt::allUniformGeps(llvm::AllocaInst & allocaInst) {
 
       // we dont care about (indirect) alloc loads
       else if (isa<LoadInst>(userInst)) {
-        if (!VectorizableType(*cast<LoadInst>(userInst)->getType())) {
+        if (!VectorizableType(*cast<LoadInst>(userInst)->getType()) ||
+            !AccessesOneField(*cast<LoadInst>(userInst)->getType(), *allocaInst.getAllocatedType(), layout)) {
           IF_DEBUG_SO { errs() << "skip: accessing non-leaf element : " << *userInst << "\n"; }
           return false;
         }
