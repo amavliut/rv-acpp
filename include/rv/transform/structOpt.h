@@ -37,6 +37,10 @@ class StructOpt {
   /// the alloca can still be varying because of stored varying values
   bool allUniformGeps(llvm::AllocaInst & allocInst);
 
+  /// make every load/store on this alloca cover exactly one scalar field: one that spans several
+  /// whole fields is split into one access per field. False if an access can not be made so
+  bool splitFieldSpanningAccesses(llvm::AllocaInst & allocInst);
+
   /// try to optimize the layout of this alloca
   bool optimizeAlloca(llvm::AllocaInst & allocInst);
 
@@ -67,6 +71,7 @@ class StructOpt {
   void promoteAlloca(llvm::AllocaInst & allocaInst);
   size_t numTransformed;
   size_t numPromoted;
+  size_t numSplit;
 
 public:
   StructOpt(VectorizationInfo & _vecInfo, const llvm::DataLayout & _layout);

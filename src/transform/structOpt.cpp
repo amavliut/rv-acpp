@@ -104,6 +104,7 @@ StructOpt::StructOpt(VectorizationInfo & _vecInfo, const DataLayout & _layout)
 , layout(_layout)
 , numTransformed(0)
 , numPromoted(0)
+, numSplit(0)
 {}
 
 Value *
@@ -356,9 +357,8 @@ StructOpt::IsGEPByBitcast(Type * actualTy, Type * bcDestTy) {
   return IsGEPByBitcast(firstElemTy, bcDestTy);
 }
 
-// whether a load/store of type accessTy covers exactly one scalar field of allocTy (compared by
-// size). Clang copies small structs as one integer, e.g. a {float, float} as one i64: that access
-// spans two fields, which the SoA layout stores in different vectors, so the alloca must stay AoS
+// whether a load/store of type accessTy has the size of the first scalar field of allocTy: the
+// check for an access whose position in the alloca is not known
 static bool
 AccessesOneField(Type & accessTy, Type & allocTy, const DataLayout & layout) {
   Type * fieldTy = &allocTy;
@@ -402,8 +402,7 @@ StructOpt::allUniformGeps(llvm::AllocaInst & allocaInst) {
         if (userInst->getOperand(0) == inst) { // leaking the value!
           return false;
         }
-        if (!VectorizableType(*cast<StoreInst>(userInst)->getValueOperand()->getType()) ||
-            !AccessesOneField(*cast<StoreInst>(userInst)->getValueOperand()->getType(), *allocaInst.getAllocatedType(), layout)) {
+        if (!VectorizableType(*cast<StoreInst>(userInst)->getValueOperand()->getType())) {
           IF_DEBUG_SO { errs() << "skip: accessing non-leaf element : " << *userInst << "\n"; }
           return false;
         }
@@ -411,8 +410,7 @@ StructOpt::allUniformGeps(llvm::AllocaInst & allocaInst) {
 
       // we dont care about (indirect) alloc loads
       else if (isa<LoadInst>(userInst)) {
-        if (!VectorizableType(*cast<LoadInst>(userInst)->getType()) ||
-            !AccessesOneField(*cast<LoadInst>(userInst)->getType(), *allocaInst.getAllocatedType(), layout)) {
+        if (!VectorizableType(*cast<LoadInst>(userInst)->getType())) {
           IF_DEBUG_SO { errs() << "skip: accessing non-leaf element : " << *userInst << "\n"; }
           return false;
         }
@@ -485,6 +483,131 @@ StructOpt::allUniformGeps(llvm::AllocaInst & allocaInst) {
     }
   }
 
+  return true;
+}
+
+// collect the scalar fields of ty (placed at byte offset base) that overlap bytes [begin, end), with
+// their offsets relative to begin; false if one of them is not a whole int/float inside the range
+static bool
+CollectFields(Type & ty, uint64_t base, uint64_t begin, uint64_t end, const DataLayout & layout,
+              SmallVectorImpl<std::pair<Type*, uint64_t>> & fields) {
+  const uint64_t size = ty.isAggregateType() ? layout.getTypeAllocSize(&ty) : layout.getTypeStoreSize(&ty);
+  if (base >= end || base + size <= begin) return true; // no overlap
+
+  if (auto * structTy = dyn_cast<StructType>(&ty)) {
+    auto * structLayout = layout.getStructLayout(structTy);
+    for (unsigned i = 0; i < structTy->getNumElements(); ++i)
+      if (!CollectFields(*structTy->getElementType(i), base + structLayout->getElementOffset(i), begin, end, layout, fields))
+        return false;
+    return true;
+  }
+  if (auto * arrTy = dyn_cast<ArrayType>(&ty)) {
+    const uint64_t elemSize = layout.getTypeAllocSize(arrTy->getElementType());
+    for (uint64_t i = begin > base ? (begin - base) / elemSize : 0; i < arrTy->getNumElements() && base + i * elemSize < end; ++i)
+      if (!CollectFields(*arrTy->getElementType(), base + i * elemSize, begin, end, layout, fields))
+        return false;
+    return true;
+  }
+
+  if (!(ty.isIntegerTy() || ty.isFloatingPointTy()) || ty.getPrimitiveSizeInBits() != 8 * size ||
+      base < begin || base + size > end)
+    return false;
+  fields.emplace_back(&ty, base - begin);
+  return true;
+}
+
+bool
+StructOpt::splitFieldSpanningAccesses(llvm::AllocaInst & allocaInst) {
+  // loads/stores on the alloca and on addresses derived from it (GEPs, phis, casts)
+  std::vector<Instruction*> accesses;
+  SmallPtrSet<Instruction*, 16> seen;
+  std::vector<Instruction*> ptrs{&allocaInst};
+  while (!ptrs.empty()) {
+    auto * ptr = ptrs.back();
+    ptrs.pop_back();
+    if (!seen.insert(ptr).second) continue;
+    for (auto * user : ptr->users()) {
+      if (isa<GetElementPtrInst, PHINode, CastInst>(user)) ptrs.push_back(cast<Instruction>(user));
+      else if (isa<LoadInst>(user) || (isa<StoreInst>(user) && cast<StoreInst>(user)->getPointerOperand() == ptr))
+        accesses.push_back(cast<Instruction>(user));
+    }
+  }
+
+  for (auto * inst : accesses) {
+    auto * load = dyn_cast<LoadInst>(inst);
+    auto * store = dyn_cast<StoreInst>(inst);
+    auto * ptr = load ? load->getPointerOperand() : store->getPointerOperand();
+    auto * accessTy = load ? load->getType() : store->getValueOperand()->getType();
+    const uint64_t size = layout.getTypeStoreSize(accessTy);
+
+    // the object the access lies in (the alloca, or an element picked by a GEP with a variable
+    // index) and the access's constant byte offset in it
+    APInt offset(layout.getIndexTypeSizeInBits(ptr->getType()), 0);
+    auto * base = ptr->stripAndAccumulateConstantOffsets(layout, offset, true);
+    Type * objTy = base == &allocaInst ? allocaInst.getAllocatedType() : nullptr;
+    if (auto * gep = dyn_cast<GetElementPtrInst>(base)) objTy = gep->getResultElementType();
+    // position not known (behind a phi, or a variable byte offset: a gep i8 picks no object)
+    if (!objTy || offset.isNegative() || offset.getZExtValue() + size > layout.getTypeAllocSize(objTy)) {
+      if (!AccessesOneField(*accessTy, *allocaInst.getAllocatedType(), layout)) return false;
+      continue;
+    }
+
+    // the fields must tile the access (no padding, no partial field)
+    SmallVector<std::pair<Type*, uint64_t>, 4> fields;
+    if (!CollectFields(*objTy, 0, offset.getZExtValue(), offset.getZExtValue() + size, layout, fields))
+      return false;
+    uint64_t covered = 0;
+    for (auto & field : fields) covered += layout.getTypeStoreSize(field.first);
+    if (covered != size) return false;
+    if (fields.size() == 1) continue;
+
+    // split: the field at byte offset o is bits [8o, ..) of the integer access
+    if (!accessTy->isIntegerTy() || accessTy->getPrimitiveSizeInBits() != 8 * size ||
+        layout.isBigEndian() || !(load ? load->isSimple() : store->isSimple()))
+      return false;
+    IF_DEBUG_SO { errs() << "split into " << fields.size() << " field accesses: " << *inst << "\n"; }
+
+    SmallVector<Instruction*, 16> newInsts;
+    IRBuilder<ConstantFolder, IRBuilderCallbackInserter> builder(
+        inst->getContext(), ConstantFolder(),
+        IRBuilderCallbackInserter([&](Instruction * newInst) { newInsts.push_back(newInst); }));
+    builder.SetInsertPoint(inst);
+    auto fieldPtr = [&](uint64_t fieldOffset) {
+      return fieldOffset ? builder.CreateInBoundsGEP(builder.getInt8Ty(), ptr, builder.getInt64(fieldOffset)) : ptr;
+    };
+
+    if (store) {
+      // field = trunc(value >> 8 * offset), as the field's type
+      for (auto & [fieldTy, fieldOffset] : fields) {
+        Value * part = store->getValueOperand();
+        if (fieldOffset) part = builder.CreateLShr(part, 8 * fieldOffset);
+        part = builder.CreateTrunc(part, builder.getIntNTy(fieldTy->getPrimitiveSizeInBits()));
+        builder.CreateAlignedStore(builder.CreateBitCast(part, fieldTy), fieldPtr(fieldOffset),
+                                   commonAlignment(store->getAlign(), fieldOffset));
+      }
+    } else {
+      // value = or of zext(field) << 8 * offset
+      Value * val = nullptr;
+      for (auto & [fieldTy, fieldOffset] : fields) {
+        Value * part = builder.CreateAlignedLoad(fieldTy, fieldPtr(fieldOffset), commonAlignment(load->getAlign(), fieldOffset));
+        part = builder.CreateZExt(builder.CreateBitCast(part, builder.getIntNTy(fieldTy->getPrimitiveSizeInBits())), accessTy);
+        if (fieldOffset) part = builder.CreateShl(part, 8 * fieldOffset);
+        val = val ? builder.CreateOr(val, part) : part;
+      }
+      load->replaceAllUsesWith(val);
+    }
+
+    // addresses keep the access's address shape, loads/stores its shape, the bit operations its
+    // value's uniformity
+    auto * data = load ? static_cast<Value*>(load) : store->getValueOperand();
+    const VectorShape valShape = getVectorShape(*data).isUniform() ? VectorShape::uni() : VectorShape::varying();
+    for (auto * newInst : newInsts)
+      vecInfo.setVectorShape(*newInst, isa<GetElementPtrInst>(newInst) ? getVectorShape(*ptr)
+                                       : isa<LoadInst, StoreInst>(newInst) ? getVectorShape(*inst) : valShape);
+    vecInfo.dropVectorShape(*inst);
+    inst->eraseFromParent();
+    ++numSplit;
+  }
   return true;
 }
 
@@ -566,6 +689,9 @@ StructOpt::optimizeAlloca(llvm::AllocaInst & allocaInst) {
   // this alloca may only be:
   // loaded from, stored to (must note store the pointer) use to derive addresses (with uniform indicies) or passsed through phi nodes
   if (!allUniformGeps(allocaInst)) return false;
+  // and every load/store must cover exactly one scalar field: clang copies small structs as one
+  // integer (e.g. a {float, float} as one i64), which the SoA layout spreads over two vectors
+  if (!splitFieldSpanningAccesses(allocaInst)) return false;
   IF_DEBUG_SO { errs() << "vectorizable uses!\n"; }
 
 
@@ -634,6 +760,7 @@ StructOpt::run() {
 
   numTransformed = 0;
   numPromoted = 0;
+  numSplit = 0;
 
   std::vector<AllocaInst*> queue;
   for (auto & bb : vecInfo.getScalarFunction()) {
@@ -654,6 +781,9 @@ StructOpt::run() {
   }
   if (numPromoted > 0) {
     Report() << "structOpt: promoted " << numPromoted << " allocas to values\n";
+  }
+  if (numSplit > 0) {
+    Report() << "structOpt: split " << numSplit << " loads/stores spanning several fields into per-field accesses\n";
   }
 
   IF_DEBUG_SO { errs() << "-- end of struct opt log --\n"; }
