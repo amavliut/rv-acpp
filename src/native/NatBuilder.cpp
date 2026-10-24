@@ -707,7 +707,14 @@ void NatBuilder::mapOperandsInto(Instruction *const scalInst, Instruction *inst,
                                          : (op->getType()->isFloatingPointTy() ? ConstantFP::get(op->getType(), 1)
                                                                               : ConstantInt::get(op->getType(), 1));
       Value *mask = vecInfo.getPredicate(*scalInst->getParent());
-      mask = vectorizedInst ? requestVectorValue(mask) : requestScalarValue(mask, laneIdx);
+      if (vectorizedInst)
+        mask = requestVectorValue(mask);
+      else if (getVectorShape(*scalInst).isUniform() && !getVectorShape(*mask).isUniform())
+        // a uniform division is computed once for all lanes: keep its divisor if any lane is
+        // active (lane 0's mask bit alone is false when lane 0 is inactive and others are not)
+        mask = createPTest(requestVectorValue(mask), false);
+      else
+        mask = requestScalarValue(mask, laneIdx);
 
       mappedOp = builder.CreateSelect(mask, mappedOp, neutralVec, "divSelect");
     }
