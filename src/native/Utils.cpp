@@ -26,8 +26,10 @@ Type *getVectorType(Type *type, unsigned width) {
 Value *createContiguousVector(unsigned width, Type *type, int start, int stride) {
   std::vector<Constant*> constants(width, nullptr);
   for (unsigned i = 0; i < width; ++i) {
-    unsigned int val = i*stride + start;
-    Constant *constant = type->isFloatingPointTy() ? ConstantFP::get(type, val) : ConstantInt::get(type, val);
+    // signed: a negative stride (e.g. a[c - lane]) must give -1, -2, .. in any lane type
+    const int64_t val = int64_t(i) * stride + start;
+    Constant *constant = type->isFloatingPointTy() ? ConstantFP::get(type, double(val))
+                                                   : ConstantInt::get(type, val, /*IsSigned*/ true);
     constants[i] = constant;
   }
   return ConstantVector::get(constants);
